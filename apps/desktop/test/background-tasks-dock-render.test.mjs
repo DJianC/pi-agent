@@ -1,0 +1,259 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { createElement } from "react";
+import { renderToStaticMarkup } from "react-dom/server";
+import { createInstance } from "i18next";
+import { I18nextProvider } from "react-i18next";
+import { catalogs } from "@pi-desktop/i18n";
+import { createServer } from "vite";
+import { fileURLToPath } from "node:url";
+
+/*
+ * What the shared container shows once a task is over.
+ *
+ * host-core keeps a finished task in its registry so its output stays readable
+ * and the renderer can show the exit code for the grace window; the entry is
+ * not deleted when the row leaves the container. The container must therefore
+ * answer to the rows it can render, never to the registry's full session list —
+ * otherwise a stopped or self-exited command leaves a permanent
+ * "1 background tasks" header with no row to stop, dismiss, or read.
+ *
+ * Rendered through the real container, store, and locale with the task data
+ * layer stubbed, so the assertion is what the user actually sees.
+ */
+
+const ROOT = fileURLToPath(new URL("..", import.meta.url));
+const HOOK = fileURLToPath(new URL("./helpers/background-tasks-hook.stub.ts", import.meta.url));
+
+const task = (id, state, exitCode) => ({
+  id,
+  sessionId: "session-dock-render",
+  command: `pnpm dev ${id}`,
+  commandShellId: "pwsh",
+  state,
+  elapsedMs: 2_000,
+  ...(exitCode === undefined ? {} : { exitCode }),
+});
+
+async function withDockRender(run) {
+  const server = await createServer({
+    root: ROOT,
+    configFile: false,
+    server: { middlewareMode: true, hmr: false, ws: false },
+    esbuild: { jsx: "automatic" },
+    appType: "custom",
+    optimizeDeps: { noDiscovery: true, include: [] },
+    plugins: [
+      {
+        // The registry read is the container's data source; stub it only.
+        name: "background-tasks-hook-stub",
+        enforce: "pre",
+        resolveId(source) {
+          return source.endsWith("background-tasks/useBackgroundTasks") ? HOOK : null;
+        },
+      },
+    ],
+  });
+  try {
+    const { TaskDock } = await server.ssrLoadModule("/src/components/TaskDock.tsx");
+    const { useAppStore } = await server.ssrLoadModule("/src/stores/app-store.ts");
+    const { useModesStore } = await server.ssrLoadModule("/src/features/modes/modes-store.ts");
+    const i18n = createInstance();
+    await i18n.init({ lng: "en", resources: { en: { translation: catalogs.en } } });
+    const render = (fixture) => {
+      const sessionId = "session-dock-render";
+      // The checklist side is the only other content the container can show.
+      const snapshot = fixture.todos
+        ? { sessionId, revision: 1, updatedAt: 1, todos: fixture.todos }
+        : undefined;
+      Object.assign(useAppStore.getInitialState(), {
+        sessionTodos: snapshot ? { [sessionId]: snapshot } : {},
+        runningSessions: fixture.sessionRunning ? { [sessionId]: true } : {},
+      });
+      Object.assign(useModesStore.getInitialState(), {
+        runs: fixture.run ? { [sessionId]: { sessionId, ...fixture.run } } : {},
+      });
+      globalThis.__piDockFixture = fixture;
+      return renderToStaticMarkup(
+        createElement(
+          I18nextProvider,
+          { i18n },
+          createElement(TaskDock, { sessionId: "session-dock-render" }),
+        ),
+      );
+    };
+    await run({ render });
+  } finally {
+    delete globalThis.__piDockFixture;
+    await server.close();
+  }
+}
+
+test("the container disappears with its last row, even though the host still lists the finished task", async () => {
+  await withDockRender(({ render }) => {
+    const finished = task("t-stopped", "stopped");
+    const html = render({ tasks: [], sessionTasks: [finished] });
+    assert.equal(
+      html,
+      "",
+      "a task the container can no longer render must not keep the container — or a task count — on screen",
+    );
+  });
+});
+
+test("registry history alone never keeps a header, even with several finished tasks", async () => {
+  await withDockRender(({ render }) => {
+    const html = render({
+      tasks: [],
+      sessionTasks: [task("t-1", "exited", 0), task("t-2", "failed", 1), task("t-3", "stopped")],
+    });
+    assert.equal(html, "");
+  });
+});
+
+test("the container counts the rows it can render", async () => {
+  await withDockRender(({ render }) => {
+    const running = task("t-running", "running");
+    const html = render({ tasks: [running], sessionTasks: [running, task("t-old", "exited", 0)] });
+    assert.match(html, /class="dock/);
+    assert.match(html, /1 background tasks/, "the header counts the renderable row");
+    assert.match(html, /1 running/);
+    assert.match(html, /pnpm dev t-running/);
+    assert.doesNotMatch(
+      html,
+      /pnpm dev t-old/,
+      "a row the container may not render must not appear",
+    );
+  });
+});
+
+test("an expanded task shows the complete multiline command above its output", async () => {
+  await withDockRender(({ render }) => {
+    const command = `# ${"long-argument-".repeat(100)}\n  sleep 60 # end of command`;
+    const running = { ...task("t-running", "running"), command };
+    const fixture = { tasks: [running], sessionTasks: [running], collapsed: false };
+    assert.doesNotMatch(render(fixture), /class="task-command-detail"/);
+
+    const html = render({
+      ...fixture,
+      expandedId: running.id,
+      output: { id: running.id, stdout: "", stderr: "", truncated: false },
+    });
+    const detail = html.match(/<code class="task-command-detail">([\s\S]*?)<\/code>/);
+    assert.equal(detail?.[1], command);
+    const output = html.indexOf('<pre class="task-output">—</pre>');
+    assert.ok(output > html.indexOf(detail[0]), "the command appears above its empty output");
+  });
+});
+
+test("a finished row inside its grace window still counts", async () => {
+  await withDockRender(({ render }) => {
+    const finished = task("t-grace", "exited", 0);
+    const html = render({ tasks: [finished], sessionTasks: [finished, task("t-hidden", "stopped")] });
+    assert.match(html, /1 background tasks/);
+    assert.doesNotMatch(html, /running/, "a finished row raises no live count");
+    assert.match(html, /pnpm dev t-grace/);
+  });
+});
+
+test("an open Goal run hides the container; the checklist returns once the run ends", async () => {
+  await withDockRender(({ render }) => {
+    const running = task("t-running", "running");
+    const fixture = {
+      tasks: [running],
+      sessionTasks: [running],
+      todos: [{ content: "ship the dock fix", status: "in_progress", priority: "high" }],
+    };
+    assert.equal(render({ ...fixture, run: { id: "run-1", modeId: "goal", state: "running" } }), "");
+    assert.equal(render({ ...fixture, run: { id: "run-1", modeId: "goal", state: "paused" } }), "");
+    assert.match(render({ ...fixture, run: { id: "run-1", modeId: "goal", state: "finished" } }), /ship the dock fix/);
+    // Only the builtin Goal takes the dock's place.
+    assert.match(render({ ...fixture, run: { id: "run-2", modeId: "review", state: "running" } }), /ship the dock fix/);
+  });
+});
+
+test("a checklist keeps the container without inventing an empty task panel", async () => {
+  await withDockRender(({ render }) => {
+    const html = render({
+      tasks: [],
+      sessionTasks: [task("t-stopped", "stopped")],
+      todos: [{ content: "ship the dock fix", status: "in_progress", priority: "high" }],
+    });
+    assert.match(html, /class="todo-dock-list"/);
+    assert.match(html, /ship the dock fix/);
+    assert.doesNotMatch(html, /class="task-list"/, "no renderable row means no task panel");
+    assert.doesNotMatch(
+      html,
+      /role="tablist"/,
+      "tabs appear only while both sides have content",
+    );
+  });
+});
+
+for (const activeTab of ["todo", "tasks"]) {
+  test(`the selected ${activeTab} tab renders only its own panel`, async () => {
+    await withDockRender(({ render }) => {
+      const running = task("t-running", "running");
+      const html = render({
+        tasks: [running],
+        sessionTasks: [running],
+        activeTab,
+        collapsed: false,
+        todos: [{ content: "finish the checklist", status: "completed", priority: "high" }],
+      });
+      assert.match(html, /role="tablist"/);
+      assert.match(html, /1 running/, "the shared header still reports live work");
+      if (activeTab === "todo") {
+        assert.match(html, /class="todo-dock-list"/);
+        assert.doesNotMatch(html, /class="task-list"/, "tasks must not leak into Todo");
+      } else {
+        assert.match(html, /class="task-list"/);
+        assert.doesNotMatch(html, /class="todo-dock-list"/, "todos must not leak into Tasks");
+      }
+    });
+  });
+}
+
+test("the working step sweeps only while its session runs, so an idle window stops repainting", async () => {
+  await withDockRender(({ render }) => {
+    // A run that ends early (abort, error, a model that never closes its step)
+    // leaves an in_progress todo behind. The shimmer is an infinite animation,
+    // so tying it to the todo status alone would keep an idle window
+    // submitting frames forever (#1064).
+    const todos = [
+      { content: "done step", status: "completed", priority: "low" },
+      { content: "working step", status: "in_progress", priority: "high" },
+    ];
+    const shimmers = (html) => (html.match(/todo-dock-shimmer/g) ?? []).length;
+    for (const collapsed of [true, false]) {
+      const base = { tasks: [], sessionTasks: [], todos, collapsed, activeTab: "todo" };
+      const idle = render({ ...base, sessionRunning: false });
+      assert.match(idle, /working step/, "the step stays visible while idle");
+      assert.equal(shimmers(idle), 0, `no sweep on an idle session (collapsed=${collapsed})`);
+      assert.equal(
+        shimmers(render({ ...base, sessionRunning: true })),
+        1,
+        `one sweep while the session runs (collapsed=${collapsed})`,
+      );
+    }
+  });
+});
+
+
+test("task actions distinguish stopping, dismissing, and cancelling continuation", async () => {
+  await withDockRender(({ render }) => {
+    for (const state of ["running", "exited", "failed", "stopped"]) {
+      for (const continuation of [undefined, "pending", "cancelled"]) {
+        const row = { ...task("actions", state), continuation };
+        const html = render({ tasks: [row], sessionTasks: [row] });
+        const context = `${state}, continuation=${continuation}`;
+        assert.equal(/>Stop<\/button>/.test(html), state === "running", context);
+        assert.equal(/>Dismiss<\/button>/.test(html), state !== "running" && continuation !== "pending", context);
+        assert.equal(/>Cancel continuation<\/button>/.test(html), continuation === "pending", context);
+        if (state !== "running" && continuation === "pending") {
+          assert.match(html, /Waiting to resume/, context);
+        }
+      }
+    }
+  });
+});
